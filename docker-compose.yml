@@ -12,6 +12,8 @@ services:
       MAYAN_CELERY_RESULT_BACKEND: redis://:${MAYAN_REDIS_PASSWORD:-mayanredispassword}@redis:6379/1
       MAYAN_DATABASES: "{'default':{'ENGINE':'django.db.backends.postgresql','NAME':'${MAYAN_DATABASE_DB:-mayan}','PASSWORD':'${MAYAN_DATABASE_PASSWORD:-mayandbpass}','USER':'${MAYAN_DATABASE_USER:-mayan}','HOST':'${MAYAN_DATABASE_HOST:-postgresql}'}}"
       MAYAN_DOCKER_WAIT: "${MAYAN_DATABASE_HOST:-postgresql}:5432 redis:6379"
+      MAYAN_DOCUMENTS_LANGUAGE_CODES: '["eng", "spa"]'
+      MAYAN_DOCUMENTS_LANGUAGE: 'spa'      
     image: mayanedms/mayanedms:${MAYAN_DOCKER_IMAGE_TAG:-3}
     networks:
       - bridge
@@ -19,7 +21,7 @@ services:
       - "8200:8000"
     restart: unless-stopped
     volumes:
-      - ${MAYAN_APP_VOLUME:-app}:/var/lib/mayan
+      - ./app:/var/lib/mayan
 
   postgresql:
     environment:
@@ -31,7 +33,7 @@ services:
       - bridge
     restart: unless-stopped
     volumes:
-      - ${MAYAN_POSTGRES_VOLUME:-postgres}:/var/lib/postgresql/data
+      - ./postgres:/var/lib/postgresql/data
 
   redis:
     command:
@@ -57,13 +59,7 @@ services:
       - bridge
     restart: unless-stopped
     volumes:
-      - ${MAYAN_REDIS_VOLUME:-redis}:/data
-
-volumes:
-  app:
-  postgres:
-  rabbitmq:
-  redis:
+      - ./redis:/data
 
 networks:
   bridge:
