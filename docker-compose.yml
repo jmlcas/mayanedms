@@ -46,7 +46,7 @@ services:
       - all_in_one
     # Disable ports if using Traefik.       
     ports:
-      - "80:8000"
+      - "8200:8000"
 
   postgresql:
     command:
