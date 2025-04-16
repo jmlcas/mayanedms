@@ -33,7 +33,7 @@ x-mayan-frontend-ports:
   &mayan-frontend-ports
   # Disable ports if using Traefik. Set to an empty list `[]`.
   ports:
-    - "${MAYAN_FRONTEND_HTTP_PORT:-80}:8000"
+    - "${MAYAN_FRONTEND_HTTP_PORT:-8200}:8000"
     # []
 
 x-mayan-traefik-labels:
