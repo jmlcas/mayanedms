@@ -1,37 +1,181 @@
-version: '3.7'
+x-mayan-container:
+  &mayan-container
+  env_file: .env
+  environment:
+    MAYAN_CELERY_BROKER_URL: amqp://${MAYAN_RABBITMQ_USER:-mayan}:${MAYAN_RABBITMQ_PASSWORD:-mayanrabbitpass}@${MAYAN_DOCKER_RABBITMQ_HOSTNAME:-rabbitmq}:${MAYAN_DOCKER_RABBITMQ_PORT:-5672}/${MAYAN_RABBITMQ_VHOST:-mayan}
+    MAYAN_CELERY_RESULT_BACKEND: redis://:${MAYAN_REDIS_PASSWORD:-mayanredispassword}@${MAYAN_DOCKER_REDIS_HOSTNAME:-redis}:${MAYAN_DOCKER_REDIS_PORT:-6379}/${MAYAN_REDIS_RESULT_DATABASE:-1}
+    MAYAN_DATABASES: "{'default':{'ENGINE':'django.db.backends.postgresql','NAME':'${MAYAN_DATABASE_NAME:-mayan}','PASSWORD':'${MAYAN_DATABASE_PASSWORD:-mayandbpass}','USER':'${MAYAN_DATABASE_USER:-mayan}','HOST':'${MAYAN_DATABASE_HOST:-postgresql}','PORT':${MAYAN_DATABASE_PORT:-},'CONN_MAX_AGE':${MAYAN_DATABASE_CONN_MAX_AGE:-0},${MAYAN_DATABASE_EXTRA_OPTIONS:-}}}"
+    MAYAN_LOCK_MANAGER_BACKEND: mayan.apps.lock_manager.backends.redis_lock.RedisLock
+    MAYAN_LOCK_MANAGER_BACKEND_ARGUMENTS: "{'redis_url':'redis://:${MAYAN_REDIS_PASSWORD:-mayanredispassword}@${MAYAN_DOCKER_REDIS_HOSTNAME:-redis}:${MAYAN_DOCKER_REDIS_PORT:-6379}/${MAYAN_REDIS_LOCK_MANAGER_DATABASE:-2}'}"
+  image: ${MAYAN_DOCKER_IMAGE_NAME:-mayanedms/mayanedms}:${MAYAN_DOCKER_IMAGE_TAG:-s4.9}
+  logging:
+    driver: "json-file"
+    options:
+      max-size: "100m"
+      max-file: "3"
+      mode: "non-blocking"
+  networks:
+    - mayan
+  restart: unless-stopped
+  volumes:
+    - ${MAYAN_APP_VOLUME:-app}:/var/lib/mayan
+    # Optional volumes to access external data like staging or watch folders
+    # - /opt/staging_folder:/staging_folder
+    # - /opt/watch_folder:/watch_folder
+
+x-mayan-dependencies:
+  &mayan-dependencies
+  depends_on:
+    setup_or_upgrade:
+      condition: service_completed_successfully
+
+x-mayan-frontend-ports:
+  &mayan-frontend-ports
+  # Disable ports if using Traefik. Set to an empty list `[]`.
+  ports:
+    - "${MAYAN_FRONTEND_HTTP_PORT:-80}:8000"
+    # []
+
+x-mayan-traefik-labels:
+  &mayan-traefik-labels
+  labels:
+    - "traefik.enable=${MAYAN_TRAEFIK_FRONTEND_ENABLE:-false}"
+    - "traefik.http.middlewares.mayan_frontend_http_redirect.redirectscheme.scheme=https"
+    - "traefik.http.middlewares.mayan_frontend_http_redirect.redirectscheme.permanent=false"
+    - "traefik.http.routers.mayan_frontend_http.entrypoints=http"
+    - "traefik.http.routers.mayan_frontend_http.middlewares=mayan_frontend_http_redirect"
+    - "traefik.http.routers.mayan_frontend_http.rule=Host(`${MAYAN_TRAEFIK_EXTERNAL_DOMAIN}`)"
+    - "traefik.http.routers.mayan_frontend_https.entrypoints=https"
+    - "traefik.http.routers.mayan_frontend_https.rule=Host(`${MAYAN_TRAEFIK_EXTERNAL_DOMAIN}`)"
+    - "traefik.http.routers.mayan_frontend_https.service=mayan_frontend_http"
+    - "traefik.http.routers.mayan_frontend_https.tls=true"
+    - "traefik.http.routers.mayan_frontend_https.tls.certresolver=letsencrypt"
+    - "traefik.http.services.mayan_frontend_http.loadbalancer.server.port=8000"
+
+networks:
+  mayan:
+    driver: bridge
+    # Change to true when using Traefik for increased security.
+    internal: false
+  traefik: {}
 
 services:
-
   app:
-    depends_on:
-      - postgresql
-      - redis
-    env_file: env_file
-    environment: &mayan_env
-      MAYAN_CELERY_BROKER_URL: redis://:${MAYAN_REDIS_PASSWORD:-mayanredispassword}@redis:6379/0
-      MAYAN_CELERY_RESULT_BACKEND: redis://:${MAYAN_REDIS_PASSWORD:-mayanredispassword}@redis:6379/1
-      MAYAN_DATABASES: "{'default':{'ENGINE':'django.db.backends.postgresql','NAME':'${MAYAN_DATABASE_DB:-mayan}','PASSWORD':'${MAYAN_DATABASE_PASSWORD:-mayandbpass}','USER':'${MAYAN_DATABASE_USER:-mayan}','HOST':'${MAYAN_DATABASE_HOST:-postgresql}'}}"
-      MAYAN_DOCKER_WAIT: "${MAYAN_DATABASE_HOST:-postgresql}:5432 redis:6379"
-    image: mayanedms/mayanedms:latest
+    <<: [*mayan-container, *mayan-traefik-labels, *mayan-frontend-ports]
+    profiles:
+      - all_in_one
+
+  elasticsearch:
+    environment:
+      - bootstrap.memory_lock=true
+      - discovery.type=single-node
+      - http.max_content_length=400mb
+      - xpack.security.enabled=true
+      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
+      - ELASTIC_PASSWORD=${MAYAN_ELASTICSEARCH_PASSWORD:-mayanespassword}
+    image: ${MAYAN_DOCKER_ELASTICSEARCH_IMAGE:-elasticsearch}:${MAYAN_DOCKER_ELASTICSEARCH_TAG:-7.17.26}
     networks:
-      - bridge
-    ports:
-      - "8200:8000"
+      - mayan
+    # Enable to allow external access to the database.
+    # ports:
+    #  - "9200:9200"
+    profiles:
+      - elasticsearch
     restart: unless-stopped
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
     volumes:
-      - ${MAYAN_APP_VOLUME:-app}:/var/lib/mayan
+      - ${MAYAN_ELASTICSEARCH_VOLUME:-elasticsearch}:/usr/share/elasticsearch/data
 
   postgresql:
+    command:
+      - "postgres"
+      - "-c"
+      - "default_statistics_target=200"
+      - "-c"
+      - "maintenance_work_mem=128MB"
+      - "-c"
+      - "max_connections=${MAYAN_DOCKER_POSTGRESQL_MAX_CONNECTIONS:-150}"
+      - "-c"
+      - "shared_buffers=512MB"
+      - "-c"
+      - "work_mem=32MB"
     environment:
-      POSTGRES_DB: ${MAYAN_DATABASE_DB:-mayan}
+      POSTGRES_DB: ${MAYAN_DATABASE_NAME:-mayan}
       POSTGRES_PASSWORD: ${MAYAN_DATABASE_PASSWORD:-mayandbpass}
       POSTGRES_USER: ${MAYAN_DATABASE_USER:-mayan}
-    image: postgres:${MAYAN_DOCKER_POSTGRES_TAG:-10.18-alpine}
+    healthcheck:
+      test: ["CMD", "pg_isready", "--username", "${MAYAN_DATABASE_USER:-mayan}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    image: ${MAYAN_DOCKER_POSTGRESQL_IMAGE:-postgres}:${MAYAN_DOCKER_POSTGRESQL_TAG:-14.15-alpine3.21}
     networks:
-      - bridge
+      - mayan
+    # Enable to allow external access to the database.
+    # ports:
+    #  - "5432:5432"
+    profiles:
+      - postgresql
+    restart: unless-stopped
+    shm_size: 128m
+    volumes:
+      - ${MAYAN_POSTGRESQL_VOLUME:-postgres}:/var/lib/postgresql/data
+      - ${MAYAN_POSTGRESQL_VOLUME_INITDB:-postgres-initdb}:/docker-entrypoint-initdb.d/
+
+  postgresql-backup:
+    command:
+      - /bin/sh
+      - -c
+      - pg_dump -F p | gzip > /backups/$(date +%Y-%m-%d_%H-%M).sql.gz
+    depends_on:
+      postgresql:
+        condition: service_healthy
+    environment:
+      PGDATABASE: ${MAYAN_DATABASE_NAME:-mayan}
+      PGHOST: ${MAYAN_DATABASE_HOST:-postgresql}
+      PGPASSWORD: ${MAYAN_DATABASE_PASSWORD:-mayandbpass}
+      PGUSER: ${MAYAN_DATABASE_USER:-mayan}
+    image: ${MAYAN_DOCKER_POSTGRESQL_IMAGE:-postgres}:${MAYAN_DOCKER_POSTGRESQL_TAG:-14.15-alpine3.21}
+    networks:
+      - mayan
+    profiles:
+      - postgresql-backup
+    restart: no
+    volumes:
+      - ${MAYAN_POSTGRESQL_BACKUPS_VOLUME:-postgres-backups}:/backups
+
+  rabbitmq:
+    environment:
+      RABBITMQ_DEFAULT_USER: ${MAYAN_RABBITMQ_USER:-mayan}
+      RABBITMQ_DEFAULT_PASS: ${MAYAN_RABBITMQ_PASSWORD:-mayanrabbitpass}
+      RABBITMQ_DEFAULT_VHOST: ${MAYAN_RABBITMQ_VHOST:-mayan}
+      RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS: ${MAYAN_RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS:--rabbit consumer_timeout ${MAYAN_RABBITMQ_CONSUMER_TIMEOUT:-1800000}}
+    hostname: ${MAYAN_DOCKER_RABBITMQ_HOSTNAME:-rabbitmq}
+    image: ${MAYAN_DOCKER_RABBITMQ_IMAGE:-rabbitmq}:${MAYAN_DOCKER_RABBITMQ_TAG:-4.0.5-management-alpine}
+    labels:
+      - "traefik.enable=${MAYAN_TRAEFIK_RABBITMQ_ENABLE:-false}"
+      - "traefik.http.routers.rabbitmq_admin_http.entrypoints=rabbitmq_admin_http"
+      - "traefik.http.routers.rabbitmq_admin_http.rule=Host(`${MAYAN_TRAEFIK_EXTERNAL_DOMAIN}`)"
+      - "traefik.http.routers.rabbitmq_admin_http.service=rabbitmq_admin_http"
+      - "traefik.http.routers.rabbitmq_admin_http.tls=true"
+      - "traefik.http.routers.rabbitmq_admin_http.tls.certresolver=letsencrypt"
+      - "traefik.http.services.rabbitmq_admin_http.loadbalancer.server.port=15672"
+    networks:
+      - mayan
+    # Enable the first port to allow access to the administration interface.
+    # Enable the second port to allow external access to the data.
+    # ports:
+    #   - "${MAYAN_RABBITMQ_ADMIN_PORT:-15672}:15672"
+    #   - "5672:5672"
+    profiles:
+      - rabbitmq
     restart: unless-stopped
     volumes:
-      - ${MAYAN_POSTGRES_VOLUME:-postgres}:/var/lib/postgresql/data
+      - ${MAYAN_RABBITMQ_VOLUME:-rabbitmq}:/var/lib/rabbitmq
 
   redis:
     command:
@@ -39,7 +183,7 @@ services:
       - --appendonly
       - "no"
       - --databases
-      - "2"
+      - "3"
       - --maxmemory
       - "100mb"
       - --maxclients
@@ -52,19 +196,216 @@ services:
       - "256"
       - --requirepass
       - "${MAYAN_REDIS_PASSWORD:-mayanredispassword}"
-    image: redis:${MAYAN_DOCKER_REDIS_TAG:-6.2-alpine}
+    image: ${MAYAN_DOCKER_REDIS_IMAGE:-redis}:${MAYAN_DOCKER_REDIS_TAG:-7.4.1-alpine3.20}
     networks:
-      - bridge
+      - mayan
+    profiles:
+      - redis
     restart: unless-stopped
     volumes:
       - ${MAYAN_REDIS_VOLUME:-redis}:/data
 
+  # Run a frontend gunicorn container
+  frontend:
+    <<: [*mayan-container, *mayan-traefik-labels, *mayan-frontend-ports, *mayan-dependencies]
+    command:
+      - run_frontend
+    profiles:
+      - extra_frontend
+      - multi_container
+
+  # Enable to run mirror a cabinet.
+  cabinet_mirror:
+    <<: [*mayan-container, *mayan-dependencies]
+    cap_add:
+      - SYS_ADMIN
+    devices:
+      - "/dev/fuse:/dev/fuse"
+    entrypoint:
+      - /bin/sh
+      - -c
+      - 'mkdir --parents /mnt/cabinet-${MAYAN_MIRROR_CABINET_NAME} && chown mayan:mayan /mnt/cabinet-${MAYAN_MIRROR_CABINET_NAME} && /usr/local/bin/entrypoint.sh run_command "mirroring_mount_cabinet --allow-other ${MAYAN_MIRROR_CABINET_NAME} /mnt/cabinet-${MAYAN_MIRROR_CABINET_NAME}"'
+    profiles:
+      - cabinet_mirror
+    security_opt:
+      - apparmor:unconfined
+    volumes:
+      - ${MAYAN_APP_VOLUME:-app}:/var/lib/mayan
+      - type: bind
+        # Location in the host where the cabinet will show up.
+        # Must be created before enabling this profile.
+        # The Docker user must have access to this folder.
+        source: /mnt/mayan_cabinets/${MAYAN_MIRROR_CABINET_NAME}
+        # Location inside the container where the cabinet will be mounted.
+        target: /mnt/cabinet-${MAYAN_MIRROR_CABINET_NAME}
+        bind:
+          propagation: shared
+
+  # Enable to run mirror an index.
+  index_mirror:
+    <<: [*mayan-container, *mayan-dependencies]
+    cap_add:
+      - SYS_ADMIN
+    devices:
+      - "/dev/fuse:/dev/fuse"
+    entrypoint:
+      - /bin/sh
+      - -c
+      - 'mkdir --parents /mnt/index-${MAYAN_MIRROR_INDEX_NAME} && chown mayan:mayan /mnt/index-${MAYAN_MIRROR_INDEX_NAME} && /usr/local/bin/entrypoint.sh run_command "mirroring_mount_index --allow-other ${MAYAN_MIRROR_INDEX_NAME} /mnt/index-${MAYAN_MIRROR_INDEX_NAME}"'
+    profiles:
+      - index_mirror
+    security_opt:
+      - apparmor:unconfined
+    volumes:
+      - ${MAYAN_APP_VOLUME:-app}:/var/lib/mayan
+      - type: bind
+        # Location in the host where the index will show up.
+        # Must be created before enabling this profile.
+        # The Docker user must have access to this folder.
+        source: /mnt/mayan_indexes/${MAYAN_MIRROR_INDEX_NAME}
+        # Location inside the container where the index will be mounted.
+        target: /mnt/index-${MAYAN_MIRROR_INDEX_NAME}
+        bind:
+          propagation: shared
+
+  # Run a separate class A worker
+  worker_a:
+    <<: [*mayan-container, *mayan-dependencies]
+    command:
+      - run_worker
+      - worker_a
+      - "--prefetch-multiplier=1"
+    profiles:
+      - extra_worker_a
+      - multi_container
+
+  # Run a separate class B worker
+  worker_b:
+    <<: [*mayan-container, *mayan-dependencies]
+    command:
+      - run_worker
+      - worker_b
+      - "--prefetch-multiplier=1"
+    profiles:
+      - extra_worker_b
+      - multi_container
+
+  # Run a separate class C worker
+  worker_c:
+    <<: [*mayan-container, *mayan-dependencies]
+    command:
+      - run_worker
+      - worker_c
+      - "--prefetch-multiplier=1"
+    profiles:
+      - extra_worker_c
+      - multi_container
+
+  # Run a separate class D worker
+  worker_d:
+    <<: [*mayan-container, *mayan-dependencies]
+    command:
+      - run_worker
+      - worker_d
+      - "--concurrency=1 --prefetch-multiplier=1"
+    profiles:
+      - extra_worker_d
+      - multi_container
+
+  # Run a separate class E worker
+  worker_e:
+    <<: [*mayan-container, *mayan-dependencies]
+    command:
+      - run_worker
+      - worker_e
+      - "--prefetch-multiplier=1"
+    profiles:
+      - extra_worker_e
+      - multi_container
+
+  worker_custom_queue:
+    <<: [*mayan-container, *mayan-dependencies]
+    command:
+      - /bin/sh
+      - -c
+      - 'MAYAN_QUEUE_LIST=${MAYAN_WORKER_CUSTOM_QUEUE_LIST} /usr/local/bin/run_worker.sh --prefetch-multiplier=1'
+    profiles:
+      - extra_worker_custom
+
+  # Run a separate Celery beat container
+  celery_beat:
+    <<: [*mayan-container, *mayan-dependencies]
+    command:
+      - run_celery
+      - "beat --pidfile= --loglevel=ERROR"
+    profiles:
+      - extra_celery_beat
+      - multi_container
+
+  setup_or_upgrade:
+    <<: *mayan-container
+    command:
+      - run_initial_setup_or_perform_upgrade
+    profiles:
+      - extra_setup_or_upgrade
+      - multi_container
+    restart: "no"
+
+  traefik:
+    container_name: "traefik"
+    command:
+      # - "--log.level=DEBUG"
+      - "--api.dashboard=true"
+      - "--api.insecure=${MAYAN_TRAEFIK_API_INSECURE:-false}"
+      - "--certificatesresolvers.letsencrypt.acme.caserver=${MAYAN_TRAEFIK_LETS_ENCRYPT_SERVER:-https://acme-staging-v02.api.letsencrypt.org/directory}"
+      - "--certificatesresolvers.letsencrypt.acme.dnschallenge=${MAYAN_TRAEFIK_LETS_ENCRYPT_DNS_CHALLENGE:-false}"
+      - "--certificatesresolvers.letsencrypt.acme.dnschallenge.provider=${MAYAN_TRAEFIK_LETS_ENCRYPT_DNS_CHALLENGE_PROVIDER}"
+      - "--certificatesresolvers.letsencrypt.acme.email=${MAYAN_TRAEFIK_LETS_ENCRYPT_EMAIL}"
+      - "--certificatesresolvers.letsencrypt.acme.storage=/traefik-certificates-letsencrypt/acme.json"
+      - "--certificatesresolvers.letsencrypt.acme.tlschallenge=${MAYAN_TRAEFIK_LETS_ENCRYPT_TLS_CHALLENGE:-false}"
+      - "--entrypoints.http.address=:80"
+      - "--entrypoints.https.address=:443"
+      - "--entrypoints.keycloak_http.address=:${MAYAN_TRAEFIK_KEYCLOAK_HTTP_PORT:-8081}"
+      - "--entrypoints.rabbitmq_admin_http.address=:15672"
+      - "--entrypoints.traefik_dashboard_http.address=:8080"
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+    # - Add DNS provider variables (https://doc.traefik.io/traefik/https/acme/#providers)
+    # environment:
+    image: ${MAYAN_DOCKER_TRAEFIK_IMAGE:-traefik}:${MAYAN_DOCKER_TRAEFIK_TAG:-v2.11.16}
+    labels:
+      - "traefik.enable=${MAYAN_TRAEFIK_DASHBOARD_ENABLE:-false}"
+      - "traefik.http.middlewares.basic-auth-global.basicauth.users=${MAYAN_TRAEFIK_DASHBOARD_AUTHENTICATION}"
+      - "traefik.http.routers.traefik_https.entrypoints=traefik_dashboard_http"
+      - "traefik.http.routers.traefik_https.middlewares=basic-auth-global"
+      - "traefik.http.routers.traefik_https.rule=Host(`${MAYAN_TRAEFIK_EXTERNAL_DOMAIN}`)"
+      - "traefik.http.routers.traefik_https.service=api@internal"
+      - "traefik.http.routers.traefik_https.tls=true"
+      - "traefik.http.routers.traefik_https.tls.certresolver=letsencrypt"
+    networks:
+      - mayan
+      - traefik
+    ports:
+      - "${MAYAN_RABBITMQ_ADMIN_HTTP_PORT:-15672}:15672"
+      - "${MAYAN_TRAEFIK_DASHBOARD_HTTP_PORT:-8080}:8080"
+      - "${MAYAN_TRAEFIK_KEYCLOAK_HTTP_PORT:-8081}:8081"
+      - "${MAYAN_TRAEFIK_HTTP_PORT:-80}:80"
+      - "${MAYAN_TRAEFIK_HTTPS_PORT:-443}:443"
+    profiles:
+      - traefik
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ${MAYAN_TRAEFIK_LETSENCRYPT_VOLUME:-traefik-certificates-letsencrypt}:/traefik-certificates-letsencrypt
+
 volumes:
   app:
+  elasticsearch:
   postgres:
+  postgres-backups:
+  postgres-initdb:
+  mountindex:
   rabbitmq:
   redis:
+  traefik-certificates-letsencrypt:
 
-networks:
-  bridge:
-    driver: bridge    
