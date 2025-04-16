@@ -1,3 +1,3 @@
 # Mayan-EDMS
 
-View in "Localhost:8200"
+Ver en "http://localhost:8200"
